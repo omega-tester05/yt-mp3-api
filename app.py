@@ -9,28 +9,30 @@ import re
 import threading
 import time
 import subprocess
+import logging
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all domains (for Android/web frontend)
+CORS(app)
+
+# ✅ Logger setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+MAX_DURATION_SECONDS = 150 * 60  # 2.5 hours
+MAX_FILENAME_LENGTH = 128
 
-MAX_DURATION_SECONDS = 150 * 60  # 2 hours 30 minutes
-
-# 🔒 Custom limiter key based on user_id
+# 🔒 Rate limiting per user_id
 def get_user_id():
     if request.method == "POST" and request.is_json:
-        user_id = request.get_json().get("user_id")
-        if user_id:
-            return str(user_id)
+        return str(request.get_json().get("user_id", "anonymous"))
     return "anonymous"
 
-# ⚠️ Limit per user_id
 limiter = Limiter(
     key_func=get_user_id,
     app=app,
-    default_limits=["10 per hour"]
+    default_limits=["30 per hour"]
 )
 
 # ✅ Check FFmpeg presence
@@ -38,29 +40,32 @@ def check_ffmpeg():
     try:
         subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
+        logger.error("FFmpeg is missing or not in PATH.")
         raise EnvironmentError("FFmpeg is not installed or not in system PATH.")
 check_ffmpeg()
 
-# ✅ Clean filename
+# ✅ Clean and truncate filename
 def sanitize_filename(title):
-    return re.sub(r'[\\/*?:"<>|]', '_', title)
+    clean = re.sub(r'[\\/*?:"<>|]', '_', title)
+    return clean[:MAX_FILENAME_LENGTH]
 
-# ✅ Auto delete downloaded file
+# ✅ Auto-delete file
 def delete_file_later(filepath, delay=600):
     def delete():
         time.sleep(delay)
         if os.path.exists(filepath):
             os.remove(filepath)
-    threading.Thread(target=delete).start()
+            logger.info(f"Deleted: {filepath}")
+    threading.Thread(target=delete, daemon=True).start()
 
-# ✅ Root route for Render homepage
+# ✅ Root
 @app.route('/')
 def index():
-    return 'YT-MP3 API is live 🎶'    
+    return 'YT-MP3 API is live 🎶'
 
-# ✅ Conversion Route
+# ✅ Convert route
 @app.route("/convert", methods=["POST"])
-@limiter.limit("3 per minute")  # Per user_id
+@limiter.limit("3 per minute")
 def convert():
     if not request.is_json:
         return jsonify({"error": "Invalid request format. JSON expected."}), 400
@@ -70,8 +75,8 @@ def convert():
     file_format = data.get("format", "mp3").lower()
     user_id = data.get("user_id")
 
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+    if not url or not re.match(r'^https?://(www\.)?(youtube\.com|youtu\.be)/', url):
+        return jsonify({"error": "Only valid YouTube URLs are supported."}), 400
     if not user_id:
         return jsonify({"error": "Missing user_id in request."}), 400
     if file_format not in ["mp3", "mp4"]:
@@ -86,7 +91,6 @@ def convert():
 
             title = info.get("title", "media")
             sanitized_title = sanitize_filename(title)
-
             filesize_bytes = (
                 info.get("filesize")
                 or info.get("filesize_approx")
@@ -94,9 +98,10 @@ def convert():
             )
             filesize_mb = round(filesize_bytes / (1024 * 1024), 2) if filesize_bytes else "Unknown"
 
+        output_filename = f"{sanitized_title}.{file_format}"
+        output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
+
         if file_format == "mp3":
-            output_filename = f"{sanitized_title}.mp3"
-            output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': output_path,
@@ -109,8 +114,6 @@ def convert():
                 'quiet': True
             }
         else:
-            output_filename = f"{sanitized_title}.mp4"
-            output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
             ydl_opts = {
                 'format': 'bestvideo+bestaudio/best',
                 'outtmpl': output_path,
@@ -121,10 +124,9 @@ def convert():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        delete_file_later(output_path)  # Clean up after 10 min
+        delete_file_later(output_path)
 
         full_url = request.host_url.rstrip('/') + f"/download/{secure_filename(output_filename)}"
-
         return jsonify({
             "title": title,
             "duration_seconds": duration,
@@ -132,16 +134,15 @@ def convert():
             "download_url": full_url
         })
 
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"Download error: {e}")
         return jsonify({"error": "Download failed. The video may be private or unsupported."}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.exception("Unexpected error")
+        return jsonify({"error": "An error occurred: " + str(e)}), 500
 
-# ✅ Safe file download
+# ✅ File download route
 @app.route("/download/<filename>")
 def download(filename):
     safe_filename = secure_filename(filename)
     return send_from_directory(DOWNLOAD_FOLDER, safe_filename)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
