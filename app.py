@@ -10,8 +10,8 @@ import threading
 import time
 import subprocess
 import logging
-from datetime import datetime
 import random
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -37,12 +37,17 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
-# Rotating user agents
+# Enhanced user agent rotation
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
 ]
+
+# IP rotation (if you have proxies available)
+PROXIES = os.getenv('PROXIES', '').split(',') if os.getenv('PROXIES') else None
 
 def check_ffmpeg():
     try:
@@ -55,6 +60,9 @@ def check_ffmpeg():
 
 def get_random_user_agent():
     return random.choice(USER_AGENTS)
+
+def get_random_proxy():
+    return random.choice(PROXIES) if PROXIES else None
 
 def sanitize_filename(title):
     clean = re.sub(r'[\\/*?:"<>|]', '_', title)
@@ -71,15 +79,15 @@ def delete_file_later(filepath, delay=600):
             logger.error(f"Error deleting file {filepath}: {str(e)}")
     threading.Thread(target=delete, daemon=True).start()
 
-def get_ydl_opts(file_format, output_path):
-    """Configuration optimized for avoiding bot detection"""
+def get_ydl_opts(file_format, output_path, retry_count=0):
+    """Enhanced configuration with automatic retry adjustments"""
     opts = {
         'format': 'bestaudio/best' if file_format == "mp3" else 'bestvideo[height<=1080]+bestaudio/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': False,
         'retries': 3,
-        'socket_timeout': 30,
+        'socket_timeout': 30 + (retry_count * 10),  # Increase timeout with each retry
         'extract_flat': False,
         'user_agent': get_random_user_agent(),
         'referer': 'https://www.youtube.com/',
@@ -93,7 +101,8 @@ def get_ydl_opts(file_format, output_path):
         'compat_opts': {
             'youtube-skip-dash-manifest': True,
             'no-youtube-unavailable-videos': True,
-        }
+        },
+        'proxy': get_random_proxy()
     }
     
     if file_format == "mp3":
@@ -137,57 +146,81 @@ def convert():
         logger.warning(f"Invalid format requested: {file_format}")
         return jsonify({"error": "Invalid format"}), 400
 
-    try:
-        logger.info(f"Processing request for URL: {url}")
-        
-        # Initial info extraction
-        with yt_dlp.YoutubeDL({
-            'quiet': True,
-            'extract_flat': True,
-            'user_agent': get_random_user_agent()
-        }) as ydl:
-            info = ydl.extract_info(url, download=False)
-            duration = info.get("duration", 0)
-            if duration > MAX_DURATION_SECONDS:
-                logger.warning(f"Video too long: {duration} seconds")
-                return jsonify({"error": "Video too long"}), 400
+    max_retries = 3
+    retry_delay = 5  # seconds between retries
 
-            title = sanitize_filename(info.get("title", "media"))
-            output_filename = f"{title}.{file_format}"
-            output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Processing request for URL: {url} (Attempt {attempt + 1}/{max_retries})")
+            
+            # Initial info extraction with different options
+            with yt_dlp.YoutubeDL({
+                'quiet': True,
+                'extract_flat': True,
+                'user_agent': get_random_user_agent(),
+                'proxy': get_random_proxy(),
+                'socket_timeout': 30
+            }) as ydl:
+                info = ydl.extract_info(url, download=False)
+                duration = info.get("duration", 0)
+                if duration > MAX_DURATION_SECONDS:
+                    logger.warning(f"Video too long: {duration} seconds")
+                    return jsonify({"error": "Video too long"}), 400
 
-        # Random delay to mimic human behavior
-        delay = random.uniform(1, 3)
-        logger.debug(f"Waiting for {delay:.2f} seconds before download")
-        time.sleep(delay)
+                title = sanitize_filename(info.get("title", "media"))
+                output_filename = f"{title}.{file_format}"
+                output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
 
-        # Download with rotated settings
-        ydl_opts = get_ydl_opts(file_format, output_path)
-        logger.debug(f"Downloading with options: {ydl_opts}")
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            # Random delay to mimic human behavior
+            delay = random.uniform(1, 3)
+            logger.debug(f"Waiting for {delay:.2f} seconds before download")
+            time.sleep(delay)
 
-        logger.info(f"Successfully downloaded: {output_filename}")
-        delete_file_later(output_path)
+            # Download with rotated settings
+            ydl_opts = get_ydl_opts(file_format, output_path, attempt)
+            logger.debug(f"Downloading with options: {json.dumps(ydl_opts, indent=2)}")
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
-        return jsonify({
-            "title": title,
-            "duration": duration,
-            "download_url": f"{request.host_url.rstrip('/')}/download/{secure_filename(output_filename)}"
-        })
+            logger.info(f"Successfully downloaded: {output_filename}")
+            delete_file_later(output_path)
 
-    except yt_dlp.utils.DownloadError as e:
-        error = str(e)
-        logger.error(f"Download failed: {error}")
-        
-        if "bot" in error.lower() or "429" in error:
-            return jsonify({"error": "Temporary restriction - try again later"}), 429
-        return jsonify({"error": "Download failed"}), 400
-        
-    except Exception as e:
-        logger.exception("Unexpected error in conversion")
-        return jsonify({"error": "Internal error"}), 500
+            return jsonify({
+                "title": title,
+                "duration": duration,
+                "download_url": f"{request.host_url.rstrip('/')}/download/{secure_filename(output_filename)}"
+            })
+
+        except yt_dlp.utils.DownloadError as e:
+            error = str(e)
+            logger.error(f"Download failed (Attempt {attempt + 1}): {error}")
+            
+            if "bot" in error.lower() or "429" in error:
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                return jsonify({
+                    "error": "YouTube temporary restriction",
+                    "solution": "Please try again later or use a VPN",
+                    "code": "rate_limit"
+                }), 429
+            return jsonify({
+                "error": "Download failed",
+                "details": error
+            }), 400
+            
+        except Exception as e:
+            logger.exception(f"Unexpected error in conversion (Attempt {attempt + 1})")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+            return jsonify({
+                "error": "Internal error",
+                "details": str(e)
+            }), 500
 
 @app.route("/download/<filename>")
 def download(filename):
