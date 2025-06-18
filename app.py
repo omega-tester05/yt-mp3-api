@@ -10,11 +10,10 @@ import threading
 import time
 import subprocess
 import logging
-# Triggering redeploy on Render
+
 app = Flask(__name__)
 CORS(app)
 
-# ✅ Logger setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,7 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 MAX_DURATION_SECONDS = 150 * 60  # 2.5 hours
 MAX_FILENAME_LENGTH = 128
 
-# 🔒 Rate limiting per user_id
+# Rate limiting per user_id
 def get_user_id():
     if request.method == "POST" and request.is_json:
         return str(request.get_json().get("user_id", "anonymous"))
@@ -35,7 +34,6 @@ limiter = Limiter(
     default_limits=["30 per hour"]
 )
 
-# ✅ Check FFmpeg presence
 def check_ffmpeg():
     try:
         subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -44,12 +42,10 @@ def check_ffmpeg():
         raise EnvironmentError("FFmpeg is not installed or not in system PATH.")
 check_ffmpeg()
 
-# ✅ Clean and truncate filename
 def sanitize_filename(title):
     clean = re.sub(r'[\\/*?:"<>|]', '_', title)
     return clean[:MAX_FILENAME_LENGTH]
 
-# ✅ Auto-delete file
 def delete_file_later(filepath, delay=600):
     def delete():
         time.sleep(delay)
@@ -58,12 +54,10 @@ def delete_file_later(filepath, delay=600):
             logger.info(f"Deleted: {filepath}")
     threading.Thread(target=delete, daemon=True).start()
 
-# ✅ Root
 @app.route('/')
 def index():
     return 'YT-MP3 API is live 🎶'
 
-# ✅ Convert route
 @app.route("/convert", methods=["POST"])
 @limiter.limit("3 per minute")
 def convert():
@@ -83,7 +77,8 @@ def convert():
         return jsonify({"error": "Invalid format. Use 'mp3' or 'mp4'."}), 400
 
     try:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        # Use cookies.txt for YouTube session authentication
+        with yt_dlp.YoutubeDL({'quiet': True, 'cookiefile': 'cookies.txt'}) as ydl:
             info = ydl.extract_info(url, download=False)
             duration = info.get("duration", 0)
             if duration > MAX_DURATION_SECONDS:
@@ -106,6 +101,7 @@ def convert():
                 'format': 'bestaudio/best',
                 'outtmpl': output_path,
                 'no-part': True,
+                'cookiefile': 'cookies.txt',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
@@ -118,6 +114,7 @@ def convert():
                 'format': 'bestvideo+bestaudio/best',
                 'outtmpl': output_path,
                 'merge_output_format': 'mp4',
+                'cookiefile': 'cookies.txt',
                 'quiet': True
             }
 
@@ -136,12 +133,11 @@ def convert():
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
-        return jsonify({"error": "Download failed. The video may be private or unsupported."}), 400
+        return jsonify({"error": "Download failed. The video may be private, require login, or be unsupported."}), 400
     except Exception as e:
         logger.exception("Unexpected error")
         return jsonify({"error": "An error occurred: " + str(e)}), 500
 
-# ✅ File download route
 @app.route("/download/<filename>")
 def download(filename):
     safe_filename = secure_filename(filename)
